@@ -1,0 +1,12 @@
+/build/
+/.local/
+.env
+.env.*
+.DS_Store
+*.p12
+*.pfx
+*.key
+*.mobileprovision
+*.provisionprofile
+__pycache__/
+*.pyc
