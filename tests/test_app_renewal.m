@@ -8,13 +8,14 @@
 @interface TestWarmupApp : WarmupApp
 @property NSUInteger starts;
 @property uint64_t startedUntil;
+@property BOOL expectsManualStart;
 @end
 @implementation TestWarmupApp
 - (void)refreshPresentation {}
 - (void)checkInput {}
 - (void)requestExpiredStart:(uint64_t)expires { [super startAutomatic:YES until:expires]; }
 - (void)startAutomatic:(BOOL)isAutomatic until:(uint64_t)expires {
-    assert(isAutomatic);
+    assert(isAutomatic == !self.expectsManualStart);
     assert([[self valueForKey:@"phase"] intValue] == MWIdle);
     assert(!self.task);
     self.starts++;
@@ -63,8 +64,18 @@ static NSData *Ack(uint64_t expires) {
     return [NSData dataWithBytes:frame length:sizeof(frame)];
 }
 
+static void TestManualStartDuration(void) {
+    TestWarmupApp *app = New(MWIdle, 0);
+    app.expectsManualStart = YES;
+    uint64_t before = MWNow();
+    [app start:nil];
+    uint64_t after = MWNow();
+    assert(app.starts == 1 && app.startedUntil >= before + 30 * MW_SECOND &&
+           app.startedUntil <= after + 30 * MW_SECOND);
+}
+
 static void TestActiveRenewalAndSplitAck(void) {
-    uint64_t old = MWNow() + 30 * MW_SECOND;
+    uint64_t old = MWNow() + 10 * MW_SECOND;
     TestWarmupApp *app = New(MWActive, old);
     NSPipe *pipe = [NSPipe pipe]; app.control = pipe.fileHandleForWriting;
     int reader = pipe.fileHandleForReading.fileDescriptor;
@@ -72,20 +83,24 @@ static void TestActiveRenewalAndSplitAck(void) {
     NSTask *same = app.task;
     Observe(app, MWInputInactive, MWNow());
     uint64_t edge = MWNow(); Observe(app, MWInputActive, edge);
+    uint64_t expected = edge + 30 * MW_SECOND;
     unsigned char frame[MW_CONTROL_FRAME_SIZE];
     assert(read(reader, frame, sizeof(frame)) == sizeof(frame));
-    assert(frame[0] == MW_CONTROL_RENEW && MWControlDecode(frame) == edge + MW_LIMIT);
+    assert(frame[0] == MW_CONTROL_RENEW && MWControlDecode(frame) == expected);
     assert(app.task == same && app.starts == 0);
     assert([[app valueForKey:@"deadline"] unsignedLongLongValue] == old); // No optimistic UI extension.
-    NSData *ack = Ack(edge + MW_LIMIT);
+    NSData *ack = Ack(expected);
     [app receivedControl:@[same, [ack subdataWithRange:NSMakeRange(0, 4)]]];
     assert([[app valueForKey:@"deadline"] unsignedLongLongValue] == old);
     [app receivedControl:@[same, [ack subdataWithRange:NSMakeRange(4, ack.length - 4)]]];
-    assert([[app valueForKey:@"deadline"] unsignedLongLongValue] == edge + MW_LIMIT);
+    assert([[app valueForKey:@"deadline"] unsignedLongLongValue] == expected);
     assert(app.pendingAutomaticDeadline == 0);
     for (int i = 0; i < 4; i++) Observe(app, MWInputActive, MWNow());
+    Observe(app, MWInputUnclear, MWNow());
+    Observe(app, MWInputActive, MWNow());
     assert(read(reader, frame, sizeof(frame)) == -1 && errno == EAGAIN);
-    [app receivedControl:@[[NSTask new], Ack(edge + MW_LIMIT + 1)]];
+    assert([[app valueForKey:@"deadline"] unsignedLongLongValue] == expected);
+    [app receivedControl:@[[NSTask new], Ack(expected + 1)]];
     assert(!app.controlFailed); // Old helper data cannot affect the current one.
     [app stop:nil]; [app finish:MWStopped];
 }
@@ -107,14 +122,14 @@ static void TestStartingAckAndInvalidFrame(void) {
 }
 
 static void TestExpiryBoundaryAndExplicitStop(void) {
-    uint64_t now = MWNow();
+    uint64_t now = MWNow(), renewed = now + 25 * MW_SECOND;
     TestWarmupApp *app = New(MWActive, now - MW_SECOND);
-    app.pendingAutomaticDeadline = now + 100 * MW_SECOND;
+    app.pendingAutomaticDeadline = renewed;
     [app finish:MWExpired];
-    assert(app.starts == 1 && app.startedUntil == now + 100 * MW_SECOND);
+    assert(app.starts == 1 && app.startedUntil == renewed);
 
-    app = New(MWActive, now + 30 * MW_SECOND);
-    app.pendingAutomaticDeadline = now + 100 * MW_SECOND;
+    app = New(MWActive, now + 10 * MW_SECOND);
+    app.pendingAutomaticDeadline = renewed;
     [app stop:nil]; [app finish:MWExpired];
     assert(!app.starts && !app.pendingAutomaticDeadline);
 
@@ -123,7 +138,7 @@ static void TestExpiryBoundaryAndExplicitStop(void) {
     uint64_t queued = MWNow();
     [app finish:MWExpired];
     Observe(app, MWInputActive, queued); // The callback was queued before the old task finished.
-    assert(app.starts == 1 && app.startedUntil == queued + MW_LIMIT);
+    assert(app.starts == 1 && app.startedUntil == queued + 30 * MW_SECOND);
 
     app = New(MWActive, now + 30 * MW_SECOND);
     Observe(app, MWInputInactive, MWNow());
@@ -269,6 +284,7 @@ static void ExpectResultAfterControlFailure(MWOutcome result, NSString *title) {
 int main(void) {
     @autoreleasepool {
         signal(SIGPIPE, SIG_IGN);
+        TestManualStartDuration();
         TestActiveRenewalAndSplitAck();
         TestStartingAckAndInvalidFrame();
         TestExpiryBoundaryAndExplicitStop();

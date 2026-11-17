@@ -14,6 +14,10 @@ static NSString *const AutoPreference = @"AutomaticWarmupEnabled";
 static const CGFloat SettingsWidth = 480;
 static const CGFloat SettingsInset = 24;
 
+static NSString *ManualWarmupTitle(void) {
+    return [NSString stringWithFormat:@"手动预热 %d 秒", MW_WARMUP_SECONDS];
+}
+
 static NSTextField *SettingsLabel(NSString *text, CGFloat size, NSFontWeight weight, NSColor *color) {
     NSTextField *label = [NSTextField wrappingLabelWithString:text];
     label.font = [NSFont systemFontOfSize:size weight:weight];
@@ -134,8 +138,10 @@ static NSArray<NSRunLoopMode> *WarmupUIModes(void) {
     [cover.heightAnchor constraintEqualToConstant:SettingsWidth / 3].active = YES;
 
     NSTextField *title = SettingsLabel(@"麦克风预热", 27, NSFontWeightSemibold, NSColor.labelColor);
-    NSTextField *description = SettingsLabel(@"每次豆包开始使用内置麦克风，预热重新计时 2 分钟。\n主要帮助后续输入，首次启动可能仍需等待。",
-                                             13, NSFontWeightRegular, NSColor.secondaryLabelColor);
+    NSString *explanation = [NSString stringWithFormat:
+        @"自动预热会从豆包每次启用内置麦克风时算起，让硬件保持开启 %d 秒。\n主要帮助后续输入，首次启动可能仍需等待。",
+        MW_WARMUP_SECONDS];
+    NSTextField *description = SettingsLabel(explanation, 13, NSFontWeightRegular, NSColor.secondaryLabelColor);
     self.autoButton = [NSButton checkboxWithTitle:@"自动预热" target:self action:@selector(toggleAutomatic:)];
     [self.autoButton setContentHuggingPriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
     [self.autoButton setContentCompressionResistancePriority:NSLayoutPriorityRequired
@@ -168,7 +174,7 @@ static NSArray<NSRunLoopMode> *WarmupUIModes(void) {
     ]];
     self.autoStatus.preferredMaxLayoutWidth = SettingsWidth - 28;
 
-    self.startButton = [NSButton buttonWithTitle:@"手动预热 2 分钟" target:self action:@selector(start:)];
+    self.startButton = [NSButton buttonWithTitle:ManualWarmupTitle() target:self action:@selector(start:)];
     self.stopButton = [NSButton buttonWithTitle:@"停止本次" target:self action:@selector(stop:)];
     self.startButton.refusesFirstResponder = YES;
     NSStackView *buttons = [NSStackView stackViewWithViews:@[self.startButton, self.stopButton]];
@@ -225,7 +231,7 @@ static NSArray<NSRunLoopMode> *WarmupUIModes(void) {
     self.menuAuto = [menu addItemWithTitle:@"自动预热" action:@selector(toggleAutomatic:) keyEquivalent:@""];
     self.menuAuto.target = self;
     [menu addItem:NSMenuItem.separatorItem];
-    self.menuStart = [menu addItemWithTitle:@"手动预热 2 分钟" action:@selector(start:) keyEquivalent:@""];
+    self.menuStart = [menu addItemWithTitle:ManualWarmupTitle() action:@selector(start:) keyEquivalent:@""];
     self.menuStart.target = self;
     self.menuStop = [menu addItemWithTitle:@"停止本次" action:@selector(stop:) keyEquivalent:@""];
     self.menuStop.target = self;
@@ -638,7 +644,9 @@ static NSArray<NSRunLoopMode> *WarmupUIModes(void) {
     NSString *message;
     switch (outcome) {
         case MWStopped: message = @"本次预热已停止。"; break;
-        case MWExpired: message = self.autoEnabled ? @"两分钟内没有新输入，预热已结束。" : @"本次预热到时结束。"; break;
+        case MWExpired:
+            message = [NSString stringWithFormat:@"%d 秒预热已结束。", MW_WARMUP_SECONDS];
+            break;
         case MWDeviceChanged: message = @"内置输入设备发生变化，预热已关闭。"; break;
         case MWNoDevice: message = @"未预热：没有可用的内置输入设备。"; break;
         case MWMultipleDevices: message = @"未预热：无法确定唯一的内置输入设备。"; break;

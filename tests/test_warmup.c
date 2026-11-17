@@ -110,7 +110,7 @@ static void TestPairedStop(void) {
     assert(stop.starts == 1 && stop.stops == 1 && stop.reports == 1);
 
     Mock timeout = NewMock();
-    uint64_t expire = timeout.now + MW_LIMIT;
+    uint64_t expire = timeout.now + 30 * MW_SECOND;
     assert(Run(&timeout, MW_LIMIT) == MWExpired);
     assert(timeout.now == expire && timeout.starts == 1 && timeout.stops == 1 && timeout.reports == 1);
 

@@ -6,7 +6,8 @@
 #include <stdint.h>
 
 #define MW_SECOND UINT64_C(1000000000)
-#define MW_LIMIT (120 * MW_SECOND)
+#define MW_WARMUP_SECONDS 30
+#define MW_LIMIT (MW_WARMUP_SECONDS * MW_SECOND)
 #define MW_STOP_GRACE MW_SECOND
 
 typedef uint32_t MWDeviceID;

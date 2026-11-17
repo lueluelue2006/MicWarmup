@@ -25,18 +25,20 @@ static MWAutoDecision Active(Fake *fake) { return Send(fake, MWInputActive, MWRo
 static void TestSessions(void) {
     Fake fake = New();
     assert(!Inactive(&fake).trigger); // Login alone never requests warmup.
-    assert(Active(&fake).trigger);
+    MWAutoDecision first = Active(&fake);
+    assert(first.trigger);
     assert(!Active(&fake).trigger); // Duplicate piri/pdv# notifications.
     MWPhase phase = MWIdle;
     assert(MWBegin(&phase));
-    uint64_t deadline = fake.now + MW_LIMIT;
+    uint64_t deadline = first.triggerAt + MW_LIMIT;
     assert(MWMarkActive(&phase));
     fake.now = deadline - MW_SECOND / 10;
     assert(!Send(&fake, MWInputInactive, MWRouteUnclear, phase != MWStopping).trigger);
+    uint64_t renewedAt = fake.now;
     MWAutoDecision renewed = Send(&fake, MWInputActive, MWRouteBuiltIn, phase != MWStopping);
-    assert(renewed.trigger && renewed.triggerAt < deadline);
+    assert(renewed.trigger && renewed.triggerAt == renewedAt && renewedAt < deadline);
     uint64_t extended = renewed.triggerAt + MW_LIMIT;
-    assert(extended > deadline + 119 * MW_SECOND);
+    assert(extended == renewedAt + 30 * MW_SECOND);
     assert(fake.state.verifyBy == 0 && !MWBegin(&phase));
     fake.now = deadline + MW_SECOND;
     assert(!Active(&fake).trigger); // Health/property notifications do not slide the deadline.
@@ -133,10 +135,10 @@ static void TestOriginalDeadline(void) {
     Fake fake = New();
     assert(!Inactive(&fake).trigger);
     MWAutoReading edge = { fake.pid, fake.object, MWInputActive, MWRouteBuiltIn, fake.now };
-    fake.now = edge.at + MW_LIMIT;
+    fake.now = edge.at + 30 * MW_SECOND;
     MWAutoDecision expired = MWAutoObserve(&fake.state, edge, fake.now, true);
     assert(!expired.trigger && !expired.verifyBy);
-    assert(!Active(&fake).trigger); // A duplicate cannot start a new 120 seconds.
+    assert(!Active(&fake).trigger); // Still active after expiry cannot start another session.
 
     assert(!Inactive(&fake).trigger);
     edge.at = fake.now;

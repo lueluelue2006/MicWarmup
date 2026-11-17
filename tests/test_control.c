@@ -101,7 +101,7 @@ static void TestRenewedAudio(const uint64_t *events, size_t count, bool duringSt
     assert(MWRunSupervised(&ops) == MWExpired);
     assert(audio.starts == 1 && audio.stops == 1 && audio.reports == 1);
     assert(audio.renewIndex == count && audio.acks.count == count);
-    assert(audio.stopAt == events[count - 1] + MW_LIMIT);
+    assert(audio.stopAt == events[count - 1] + 30 * MW_SECOND);
     assert(MWControlNextCheck(&audio.control) == audio.stopAt + MW_STOP_GRACE);
 }
 
@@ -202,7 +202,7 @@ static void TestExpiryBoundary(void) {
 static void TestStartupDeadline(void) {
     MWControl control;
     Acks acks = {0};
-    uint64_t began = Base + MW_SECOND, cutoff = began + MW_START_LIMIT;
+    uint64_t began = Base + MW_SECOND, cutoff = began + 15 * MW_SECOND;
     uint64_t firstLease = began + MW_SECOND;
     assert(MWControlInit(&control, Base, firstLease));
     assert(MWControlBeginStartup(&control, began));
@@ -255,7 +255,7 @@ static void TestStartupStopRaces(void) {
 }
 
 int main(void) {
-    const uint64_t renewals[] = { Base + MW_LIMIT - 100 * Millisecond, Base + 200 * MW_SECOND };
+    const uint64_t renewals[] = { Base + MW_LIMIT - 100 * Millisecond, Base + 45 * MW_SECOND };
     const uint64_t whileStarting[] = { Base + MW_SECOND };
     TestRenewedAudio(renewals, 1, false);
     TestRenewedAudio(renewals, 2, false);

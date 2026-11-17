@@ -11,12 +11,11 @@
 ## 它做什么
 
 - 打开后在菜单栏待命，不显示 Dock 图标。
-- 观察到豆包新开始使用内置麦克风后，启动两分钟预热。
-- 两分钟内再次观察到新的收音启动，就从那次启动重新计时两分钟。
-- 可以手动预热、停止本次预热、关闭自动模式或退出。
+- 观察到豆包新开始使用内置麦克风后，让硬件保持开启 30 秒。豆包再次开始收音时，从那一刻重新计时 30 秒。
+- 也可以手动启动 30 秒预热、提前停止本次预热、关闭自动模式或退出。
 - 不注册音频采样回调，不读取、保存或上传声音，也不运行语音模型。
 
-例如：10:00 开始一次语音输入，截止时间为 10:02；10:01 再开始一次，截止时间变为 10:03。一直保持同一条输入流活跃，不会自行续时。
+例如，刚开始一次语音输入时，倒计时为 30 秒。如果 20 秒后又开始一次，从第一次开始算，预热一共持续 50 秒。同一条输入流持续活跃或房间里有人说话，都不会自行续时。
 
 这个办法主要帮助**后续录音**。第一次录音仍可能需要等待；预热不能解决网络识别、服务器或系统整体卡顿。硬件保持运行也可能增加耗电，目前没有可靠的额外功耗测量。
 
@@ -90,4 +89,4 @@ bash scripts/package.sh "$app"
 
 ### English summary
 
-MicWarmup is a small macOS menu bar utility that requests a short warm period for the built-in microphone after Doubao IME starts using it. Each new inactive-to-active input transition renews a two-minute timer. It does not read audio samples, record audio, or send network requests. Automatic mode requires macOS 14.2+, while manual mode targets macOS 12+. Releases are experimental, self-signed, and not yet notarized. Source code and project releases are available under the MIT license.
+MicWarmup is a small macOS menu bar utility that keeps the built-in microphone hardware running for 30 seconds after Doubao IME starts using it. Each new inactive-to-active input transition restarts the 30-second timer. You can also start a 30-second warmup manually. It does not read audio samples, record audio, or send network requests. Automatic mode requires macOS 14.2+, while manual mode targets macOS 12+. Releases are experimental, self-signed, and not yet notarized. Source code and project releases are available under the MIT license.
