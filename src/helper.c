@@ -37,21 +37,21 @@ static int32_t Stop(void *ctx, MWDeviceID id) {
     AudioStopping(ctx);
     return AudioDeviceStop(id, NULL);
 }
-static bool StillAvailable(void *ctx, MWDeviceID id) {
-    MWInput input = MWProbeBuiltInInput(false);
-    bool available = input.selection == MWInputOK && input.id == id;
-    if (!available) AudioStopping(ctx);
-    return available;
+static MWDeviceState DeviceState(void *ctx, MWDeviceID id) {
+    (void)ctx;
+    return MWCheckBuiltInInput(id);
 }
 static bool ReportActive(void *ctx, MWBefore before) {
+    Session *session = ctx;
+    if (MWControlAudioInterruption(&session->control, MWNow()) != MWContinue) return false;
     const char byte = (char)before;
-    if (write(STDOUT_FILENO, &byte, 1) == 1) return true;
+    if (write(STDOUT_FILENO, &byte, 1) == 1) return MWControlAudioReady(&session->control, MWNow());
     AudioStopping(ctx);
     return false;
 }
 static MWInterrupt Interruption(void *ctx) {
     Session *session = ctx;
-    return MWControlInterruption(&session->control);
+    return MWControlAudioInterruption(&session->control, MWNow());
 }
 static uint64_t Now(void *ctx) { (void)ctx; return MWNow(); }
 static void Pause(void *ctx, uint64_t duration) {
@@ -62,7 +62,7 @@ static void Pause(void *ctx, uint64_t duration) {
 
 static void *RunAudio(void *ctx) {
     Session *session = ctx;
-    MWOps ops = { ctx, Probe, Start, Stop, StillAvailable, ReportActive, Interruption, Now, Pause };
+    MWOps ops = { ctx, Probe, Start, Stop, DeviceState, ReportActive, Interruption, Now, Pause };
     session->outcome = MWRunSupervised(&ops);
     AudioStopping(session);
     atomic_store(&session->finished, true);
@@ -166,11 +166,11 @@ static bool Ack(void *ctx, uint64_t deadline) {
     return write(STDOUT_FILENO, frame, sizeof(frame)) == (ssize_t)sizeof(frame);
 }
 
-static bool Advance(Session *session, pid_t owner, int waitMs) {
+static int Advance(Session *session, pid_t owner, int waitMs) {
     unsigned char bytes[CommandBudget];
     size_t size = 0;
     MWInterrupt outside = MWContinue;
-    if (Interruption(session) == MWContinue) outside = ReadCommands(owner, waitMs, bytes, &size);
+    if (MWControlInterruption(&session->control) == MWContinue) outside = ReadCommands(owner, waitMs, bytes, &size);
     else if (waitMs) Pause(NULL, (uint64_t)waitMs * Millisecond);
     uint64_t now = MWNow();
     if (OwnerState(owner) != MWContinue) outside = MWCancel;
@@ -187,8 +187,14 @@ static uint64_t ReadNumber(const char *text) {
 static int Supervise(pid_t owner, uint64_t deadline) {
     uint64_t now = MWNow();
     Session session = {0};
-    if (owner <= 1 || getppid() != owner || !IsPipe(STDIN_FILENO) || !IsPipe(STDOUT_FILENO) ||
-        !MWControlInit(&session.control, now, deadline)) return MWControlFailed;
+    if (owner <= 1 || getppid() != owner || !IsPipe(STDIN_FILENO) || !IsPipe(STDOUT_FILENO)) {
+        return MWControlFailed;
+    }
+    if (!MWControlInit(&session.control, now, deadline)) {
+        // A valid request can expire while the child is waiting to be scheduled.
+        if (deadline && deadline <= now && deadline <= UINT64_MAX - MW_STOP_GRACE) return MWExpired;
+        return MWControlFailed;
+    }
     atomic_init(&session.finished, false);
 
     struct sigaction signalAction = { .sa_handler = CancelOnSignal };
@@ -201,8 +207,9 @@ static int Supervise(pid_t owner, uint64_t deadline) {
 
     MWInterrupt initial = AwaitStart(owner, now, deadline);
     if (initial == MWContinue) {
-        if (!Advance(&session, owner, 0)) return MWWatchdog;
-        initial = Interruption(&session);
+        int forcedExit = Advance(&session, owner, 0);
+        if (forcedExit) return forcedExit;
+        initial = MWControlInterruption(&session.control);
     }
     if (initial == MWCancel) return MWStopped;
     if (initial == MWTimeUp) return MWExpired;
@@ -213,6 +220,7 @@ static int Supervise(pid_t owner, uint64_t deadline) {
     sigemptyset(&signals);
     sigaddset(&signals, SIGTERM);
     sigaddset(&signals, SIGINT);
+    if (!MWControlBeginStartup(&session.control, MWNow())) return MWControlFailed;
     if (pthread_sigmask(SIG_BLOCK, &signals, NULL) != 0) return MWControlFailed;
     pthread_t audio;
     if (pthread_create(&audio, NULL, RunAudio, &session) != 0) return MWControlFailed;
@@ -221,12 +229,13 @@ static int Supervise(pid_t owner, uint64_t deadline) {
     while (!atomic_load(&session.finished)) {
         now = MWNow();
         int waitMs = PollInterval(now, MWControlNextCheck(&session.control));
-        if (!Advance(&session, owner, waitMs) && !atomic_load(&session.finished)) {
-            _exit(MWWatchdog);
+        int forcedExit = Advance(&session, owner, waitMs);
+        if (forcedExit && !atomic_load(&session.finished)) {
+            _exit(forcedExit);
         }
     }
     pthread_join(audio, NULL);
-    return session.outcome;
+    return MWControlCompletedOutcome(&session.control, session.outcome);
 }
 
 int main(int argc, char **argv) {

@@ -83,6 +83,7 @@ static NSArray<NSRunLoopMode> *WarmupUIModes(void) {
 @property BOOL autoEnabled;
 @property BOOL sleeping;
 @property BOOL sessionAutomatic;
+@property BOOL stoppingForRouteChange;
 @end
 
 @implementation WarmupApp
@@ -307,6 +308,7 @@ static NSArray<NSRunLoopMode> *WarmupUIModes(void) {
 - (void)resetAutomatic {
     automatic = (MWAutoState){0};
     self.pendingAutomaticDeadline = 0;
+    self.stoppingForRouteChange = NO;
     self.autoBinding = 0;
     self.autoEpoch++;
     BOOL watching = self.autoEnabled && !self.sleeping && !self.exitPending;
@@ -335,6 +337,14 @@ static NSArray<NSRunLoopMode> *WarmupUIModes(void) {
         automatic = (MWAutoState){0}; self.autoBinding = binding;
         self.pendingAutomaticDeadline = 0;
     }
+    if (reading.at && reading.at <= automatic.lastReadingAt) return;
+    BOOL otherInput = reading.activity == MWInputActive && reading.route == MWRouteOther;
+    if (otherInput) {
+        self.pendingAutomaticDeadline = 0;
+        if (self.sessionAutomatic && (phase == MWStarting || phase == MWActive || self.stoppingForRouteChange)) {
+            [self stopAt:reading.at forRouteChange:YES];
+        }
+    }
     switch (reading.activity) {
         case MWInputInactive:
             [self showAutomatic:@"自动待命，等豆包使用内置麦克风。" menuTitle:@"自动待命"]; break;
@@ -350,13 +360,16 @@ static NSArray<NSRunLoopMode> *WarmupUIModes(void) {
         default:
             [self showAutomatic:@"等待确认豆包的麦克风状态。" menuTitle:@"自动待命"]; break;
     }
-    BOOL mayTrigger = phase != MWStopping && reading.at >= self.idleSince;
+    BOOL mayTrigger = !otherInput && (phase != MWStopping || self.stoppingForRouteChange) &&
+                      reading.at >= self.idleSince;
     MWAutoDecision decision = MWAutoObserve(&automatic, reading, MWNow(), mayTrigger);
     if (decision.trigger && decision.triggerAt >= self.idleSince && decision.triggerAt &&
         decision.triggerAt <= UINT64_MAX - MW_LIMIT) {
         uint64_t expires = decision.triggerAt + MW_LIMIT;
         if (expires <= MWNow()) return;
         if (phase == MWIdle) [self startAutomatic:YES until:expires];
+        // A new built-in input may arrive while the previous route's helper is stopping.
+        else if (phase == MWStopping) self.pendingAutomaticDeadline = expires;
         else [self renewAutomaticUntil:expires];
     }
     else if (decision.verifyBy) [self.monitor retryBefore:decision.verifyBy epoch:epoch binding:binding];
@@ -399,9 +412,10 @@ static NSArray<NSRunLoopMode> *WarmupUIModes(void) {
 }
 
 - (void)startAutomatic:(BOOL)isAutomatic until:(uint64_t)expires {
+    uint64_t now = MWNow();
+    if (isAutomatic && expires && expires <= now) return;
     if (self.exitPending || self.sleeping || !MWBegin(&phase)) return;
     self.sessionAutomatic = isAutomatic;
-    uint64_t now = MWNow();
     if (!now || expires <= now || expires - now > MW_LIMIT) { [self finish:MWControlFailed]; return; }
     deadline = expires;
     self.requestedDeadline = expires;
@@ -459,9 +473,22 @@ static NSArray<NSRunLoopMode> *WarmupUIModes(void) {
         return;
     }
     const char request = 'S';
+    [self sendControlBytes:&request length:1];
+}
+
+- (BOOL)sendControlBytes:(const void *)bytes length:(size_t)length {
+    if (!self.control) return NO;
     ssize_t sent;
-    do { sent = write(self.control.fileDescriptor, &request, 1); } while (sent < 0 && errno == EINTR);
-    if (sent != 1) { self.controlFailed = YES; [self stop:nil]; }
+    do { sent = write(self.control.fileDescriptor, bytes, length); } while (sent < 0 && errno == EINTR);
+    if (sent == (ssize_t)length) return YES;
+    if (sent < 0 && errno == EPIPE) {
+        // The helper may have expired even before it received the first byte.
+        // Its exit status determines whether a newer pending edge can resume.
+        [self closeControl];
+    } else {
+        self.controlFailed = YES; [self stop:nil];
+    }
+    return NO;
 }
 
 - (void)renewAutomaticUntil:(uint64_t)expires {
@@ -470,19 +497,11 @@ static NSArray<NSRunLoopMode> *WarmupUIModes(void) {
         (phase != MWStarting && phase != MWActive) || !now || expires <= now ||
         expires - now > MW_LIMIT || expires <= self.requestedDeadline) return;
     self.pendingAutomaticDeadline = expires;
-    if (!self.control) return; // A natural expiry may already be closing the old helper.
     unsigned char request[MW_CONTROL_FRAME_SIZE];
     MWControlEncode(request, MW_CONTROL_RENEW, expires);
-    ssize_t count;
-    do { count = write(self.control.fileDescriptor, request, sizeof(request)); } while (count < 0 && errno == EINTR);
-    if (count == (ssize_t)sizeof(request)) {
+    if ([self sendControlBytes:request length:sizeof(request)]) {
         self.requestedDeadline = expires;
         // The visible deadline moves only when this same helper acknowledges it.
-    } else if (count < 0 && errno == EPIPE) {
-        [self closeControl]; // finish: may preserve this edge only for MWExpired.
-    } else {
-        self.controlFailed = YES;
-        [self stop:nil];
     }
 }
 
@@ -557,9 +576,14 @@ static NSArray<NSRunLoopMode> *WarmupUIModes(void) {
 
 - (void)stop:(id)sender {
     (void)sender;
+    [self stopAt:MWNow() forRouteChange:NO];
+}
+
+- (void)stopAt:(uint64_t)at forRouteChange:(BOOL)routeChange {
+    self.stoppingForRouteChange = routeChange;
     self.pendingAutomaticDeadline = 0;
     automatic.verifyBy = automatic.edgeAt = 0;
-    self.idleSince = MWNow();
+    self.idleSince = MAX(self.idleSince, at);
     if (!MWEnd(&phase)) return;
     [self.timer invalidate];
     self.timer = nil;
@@ -570,11 +594,18 @@ static NSArray<NSRunLoopMode> *WarmupUIModes(void) {
 
 - (void)finish:(MWOutcome)outcome {
     BOOL naturalExpiry = outcome == MWExpired && phase != MWStopping && !self.controlFailed;
+    BOOL cleanRouteStop = self.stoppingForRouteChange && !self.controlFailed &&
+                          (outcome == MWStopped || outcome == MWExpired || outcome == MWDeviceChanged);
     uint64_t next = self.pendingAutomaticDeadline;
-    BOOL resume = naturalExpiry && self.autoEnabled &&
-                  !self.sleeping && !self.exitPending && next > deadline && next > MWNow();
+    BOOL resume = (cleanRouteStop || (naturalExpiry && next > deadline)) &&
+                  self.autoEnabled && !self.sleeping && !self.exitPending && next > MWNow();
+    if (resume && self.monitor) {
+        resume = next > MW_LIMIT && [self.monitor canResumeFrom:next - MW_LIMIT
+                                                         epoch:self.autoEpoch binding:self.autoBinding];
+    }
     if (outcome == MWExpired && !naturalExpiry) outcome = MWStopped;
-    if (self.controlFailed) outcome = MWControlFailed;
+    // Keep the helper's specific result, especially when it could not confirm a stop.
+    if (self.controlFailed && outcome == MWStopped) outcome = MWControlFailed;
     [self.timer invalidate];
     self.timer = nil;
     [self closeControl];
@@ -583,11 +614,12 @@ static NSArray<NSRunLoopMode> *WarmupUIModes(void) {
     self.helperOutput = nil;
     self.controlBuffer = nil;
     self.pendingAutomaticDeadline = 0;
+    self.stoppingForRouteChange = NO;
     self.task = nil;
     phase = MWIdle;
-    // A queued real edge can outlive a naturally expiring helper. Keep its
-    // event time eligible; explicit stops/errors discard prior-session edges.
-    if (!naturalExpiry) {
+    // Keep later input eligible across expiry or a confirmed route switch.
+    // An explicit stop or a failure invalidates readings from that session.
+    if (!naturalExpiry && !cleanRouteStop) {
         self.idleSince = MWNow();
         automatic.verifyBy = automatic.edgeAt = 0;
     }
@@ -597,6 +629,10 @@ static NSArray<NSRunLoopMode> *WarmupUIModes(void) {
     switch (outcome) {
         case MWStopped: case MWExpired: case MWDeviceChanged: self.problemTitle = nil; break;
         case MWStopFailed: case MWWatchdog: self.problemTitle = @"停止未确认"; break;
+        case MWStartTimedOut: self.problemTitle = @"启动超时，状态未确认"; break;
+        case MWStartTimedOutStopped: self.problemTitle = @"启动超时，预热已停止"; break;
+        case MWSessionQueryFailed: self.problemTitle = @"设备状态无法确认"; break;
+        case MWControlFailed: self.problemTitle = @"辅助进程通信异常"; break;
         default: self.problemTitle = @"未能启动预热"; break;
     }
     NSString *message;
@@ -608,6 +644,9 @@ static NSArray<NSRunLoopMode> *WarmupUIModes(void) {
         case MWMultipleDevices: message = @"未预热：无法确定唯一的内置输入设备。"; break;
         case MWQueryFailed: message = @"未预热：无法读取内置输入设备状态。"; break;
         case MWStartFailed: message = @"系统未接受预热请求。"; break;
+        case MWStartTimedOut: message = @"预热启动超时，系统未确认内置麦克风状态。"; break;
+        case MWStartTimedOutStopped: message = @"预热启动超时，本次预热已正常停止。"; break;
+        case MWSessionQueryFailed: message = @"无法确认内置输入设备状态，本次预热已停止。"; break;
         case MWStopFailed: message = @"辅助进程已退出，系统未确认正常停止。"; break;
         case MWWatchdog: message = @"辅助进程已结束，系统未确认正常停止。"; break;
         default: message = @"无法完成预热：辅助进程或通信异常。"; break;

@@ -11,6 +11,7 @@
 
 typedef uint32_t MWDeviceID;
 typedef enum { MWInputOK, MWInputNone, MWInputAmbiguous, MWInputQueryFailed } MWSelection;
+typedef enum { MWDeviceUnknown, MWDeviceAvailable, MWDeviceUnavailable } MWDeviceState;
 typedef enum { MWBeforeUnknown = 'U', MWBeforeStopped = 'I', MWBeforeRunning = 'R' } MWBefore;
 
 typedef struct {
@@ -36,6 +37,7 @@ typedef enum {
     MWStopped = 0, MWExpired = 20, MWDeviceChanged = 21, MWNoDevice = 22,
     MWMultipleDevices = 23, MWQueryFailed = 24, MWStartFailed = 25,
     MWStopFailed = 26, MWWatchdog = 27, MWControlFailed = 28,
+    MWSessionQueryFailed = 29, MWStartTimedOut = 30, MWStartTimedOutStopped = 31,
 } MWOutcome;
 
 typedef enum { MWContinue, MWCancel, MWTimeUp, MWControlError } MWInterrupt;
@@ -45,7 +47,7 @@ typedef struct {
     MWInput (*probe)(void *ctx);
     int32_t (*start)(void *ctx, MWDeviceID id);
     int32_t (*stop)(void *ctx, MWDeviceID id);
-    bool (*stillAvailable)(void *ctx, MWDeviceID id);
+    MWDeviceState (*deviceState)(void *ctx, MWDeviceID id);
     bool (*reportActive)(void *ctx, MWBefore before);
     MWInterrupt (*interruption)(void *ctx);
     uint64_t (*now)(void *ctx);

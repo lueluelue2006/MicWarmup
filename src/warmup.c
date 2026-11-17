@@ -65,27 +65,33 @@ static MWOutcome Run(const MWOps *ops, bool supervised, uint64_t stopAt) {
     if (ops->start(ctx, input.id) != 0) return MWStartFailed;
 
     // There is exactly one exit through stop after any successful start.
-    bool deviceChanged = false;
-    signal = Check(ops, supervised, stopAt);
-    if (signal == MWContinue) {
-        deviceChanged = !ops->stillAvailable(ctx, input.id);
-        signal = Check(ops, supervised, stopAt);
-        if (!deviceChanged && signal == MWContinue && !ops->reportActive(ctx, input.before)) {
-            signal = MWCancel;
-        }
-    }
-    uint64_t nextProbe = ops->now(ctx) + MW_SECOND / 2;
-    while (signal == MWContinue && !deviceChanged) {
-        ops->pause(ctx, MW_SECOND / 20);
-        signal = Check(ops, supervised, stopAt);
+    const uint64_t pollInterval = MW_SECOND / 20;
+    bool reported = false, retrying = false;
+    uint64_t nextProbe = 0;
+    MWOutcome outcome = MWStopped;
+    while ((signal = Check(ops, supervised, stopAt)) == MWContinue) {
         uint64_t now = ops->now(ctx);
-        if (signal == MWContinue && now >= nextProbe) {
-            deviceChanged = !ops->stillAvailable(ctx, input.id);
-            nextProbe = now + MW_SECOND / 2;
+        if (now >= nextProbe) {
+            MWDeviceState state = ops->deviceState(ctx, input.id);
+            signal = Check(ops, supervised, stopAt);
+            if (signal != MWContinue) break;
+            if (state == MWDeviceUnavailable) { outcome = MWDeviceChanged; break; }
+            if (state == MWDeviceUnknown && retrying) { outcome = MWSessionQueryFailed; break; }
+            retrying = state == MWDeviceUnknown;
+            if (!retrying && !reported) {
+                if (!ops->reportActive(ctx, input.before)) {
+                    signal = Check(ops, supervised, stopAt);
+                    break;
+                }
+                reported = true;
+            }
+            // Recheck an inconclusive read on the next poll, including the first read after start.
+            nextProbe = ops->now(ctx) + (retrying ? pollInterval : MW_SECOND / 2);
         }
+        ops->pause(ctx, pollInterval);
     }
     if (ops->stop(ctx, input.id) != 0) return MWStopFailed;
-    return deviceChanged ? MWDeviceChanged : Result(signal);
+    return signal == MWContinue ? outcome : Result(signal);
 }
 
 MWOutcome MWRun(const MWOps *ops, uint64_t stopAt) { return Run(ops, false, stopAt); }

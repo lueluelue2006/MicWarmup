@@ -66,6 +66,7 @@ static MWInputRoute ReadRoute(AudioObjectID object) {
 // Only the worker writes these counters. Main reads them to reject queued stale updates.
 @property (atomic) uint64_t epoch;
 @property (atomic) uint64_t binding;
+@property (atomic) uint64_t lastOtherRouteAt;
 @property BOOL watching;
 @property BOOL confirmed;
 @property BOOL refreshQueued;
@@ -85,6 +86,9 @@ static MWInputRoute ReadRoute(AudioObjectID object) {
 }
 
 - (void)publish:(MWAutoReading)reading supported:(BOOL)supported {
+    if (reading.activity == MWInputActive && reading.route == MWRouteOther) {
+        self.lastOtherRouteAt = reading.at;
+    }
     uint64_t epoch = self.epoch, binding = self.binding;
     NSArray *message = @[@(epoch), @(binding), @(supported),
         [NSData dataWithBytes:&reading length:sizeof(reading)]];
@@ -95,10 +99,18 @@ static MWInputRoute ReadRoute(AudioObjectID object) {
 - (void)deliver:(NSArray *)message {
     uint64_t epoch = [message[0] unsignedLongLongValue], binding = [message[1] unsignedLongLongValue];
     NSData *data = message[3];
-    if (self.epoch != epoch || self.binding != binding || data.length != sizeof(MWAutoReading)) return;
+    if (data.length != sizeof(MWAutoReading)) return;
     MWAutoReading reading;
     [data getBytes:&reading length:sizeof(reading)];
+    // An observed switch away from the built-in mic takes precedence over older
+    // queued readings. Simply finishing a short utterance preserves its start.
+    if (reading.at && reading.at <= self.lastOtherRouteAt && reading.route != MWRouteOther) return;
+    if (self.binding != binding || self.epoch != epoch) return;
     self.update(epoch, binding, [message[2] boolValue], reading);
+}
+
+- (BOOL)canResumeFrom:(uint64_t)edgeAt epoch:(uint64_t)epoch binding:(uint64_t)binding {
+    return edgeAt > self.lastOtherRouteAt && self.binding == binding && self.epoch == epoch;
 }
 
 - (void)sample {
@@ -112,6 +124,7 @@ static MWInputRoute ReadRoute(AudioObjectID object) {
 
 - (void)unbind {
     self.binding++;
+    self.lastOtherRouteAt = 0;
     self.confirmed = NO;
     self.retryQueued = NO;
     if (self.processListener) {

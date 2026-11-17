@@ -108,15 +108,64 @@ static void TestQueriesAndRoutes(void) {
     assert(!Active(&fake).trigger); // Pending validation did not survive a blocked phase.
 }
 
-static void TestDelayedDelivery(void) {
+static void TestDelayedConfirmedShortInput(void) {
+    const uint64_t lags[] = { MW_ROUTE_WINDOW, 2 * MW_SECOND, MW_LIMIT - 1 };
+    for (size_t i = 0; i < sizeof(lags) / sizeof(lags[0]); i++) {
+        Fake fake = New();
+        assert(!Inactive(&fake).trigger);
+        MWAutoReading edge = { fake.pid, fake.object, MWInputActive, MWRouteBuiltIn, fake.now };
+        MWAutoReading ended = { fake.pid, fake.object, MWInputInactive, MWRouteUnclear,
+                                 edge.at + MW_SECOND / 10 };
+        uint64_t delivered = edge.at + lags[i]; // Both observations waited on the main queue.
+        MWAutoDecision decision = MWAutoObserve(&fake.state, edge, delivered, true);
+        assert(decision.trigger && !decision.verifyBy && decision.triggerAt == edge.at);
+        assert(decision.triggerAt + MW_LIMIT - delivered == MW_LIMIT - lags[i]);
+        assert(!MWAutoObserve(&fake.state, edge, delivered, true).trigger);
+        assert(!MWAutoObserve(&fake.state, ended, delivered, true).trigger);
+        assert(!MWAutoObserve(&fake.state, edge, delivered, true).trigger); // Replay after inactivity.
+        edge.at = ended.at + 1;
+        decision = MWAutoObserve(&fake.state, edge, delivered, true);
+        assert(decision.trigger && decision.triggerAt == edge.at); // The next genuine edge can renew.
+    }
+}
+
+static void TestOriginalDeadline(void) {
     Fake fake = New();
     assert(!Inactive(&fake).trigger);
-    MWAutoReading late = { fake.pid, fake.object, MWInputActive, MWRouteBuiltIn, fake.now };
+    MWAutoReading edge = { fake.pid, fake.object, MWInputActive, MWRouteBuiltIn, fake.now };
+    fake.now = edge.at + MW_LIMIT;
+    MWAutoDecision expired = MWAutoObserve(&fake.state, edge, fake.now, true);
+    assert(!expired.trigger && !expired.verifyBy);
+    assert(!Active(&fake).trigger); // A duplicate cannot start a new 120 seconds.
+
+    assert(!Inactive(&fake).trigger);
+    edge.at = fake.now;
+    edge.route = MWRouteUnclear;
+    uint64_t expires = edge.at + MW_LIMIT;
+    fake.now = expires - MW_SECOND / 10;
+    MWAutoDecision pending = MWAutoObserve(&fake.state, edge, fake.now, true);
+    assert(!pending.trigger && pending.verifyBy == expires);
+    fake.now = expires;
+    assert(!Active(&fake).trigger);
+
+    fake.now = UINT64_MAX - MW_LIMIT + 1;
+    assert(!Inactive(&fake).trigger);
+    edge.at = fake.now;
+    edge.route = MWRouteBuiltIn;
+    expired = MWAutoObserve(&fake.state, edge, fake.now, true);
+    assert(!expired.trigger && !expired.verifyBy); // The absolute deadline must be representable.
+}
+
+static void TestDelayedUnresolvedRoute(void) {
+    Fake fake = New();
+    assert(!Inactive(&fake).trigger);
+    MWAutoReading late = { fake.pid, fake.object, MWInputActive, MWRouteUnclear, fake.now };
     fake.now += 3 * MW_SECOND / 2;
     MWAutoDecision pending = MWAutoObserve(&fake.state, late, fake.now, true);
     assert(!pending.trigger && pending.verifyBy == fake.now + MW_ROUTE_WINDOW);
 
     MWAutoReading queued = late;
+    queued.route = MWRouteBuiltIn;
     queued.at = fake.now - MW_SECOND / 10;
     MWAutoDecision stillPending = MWAutoObserve(&fake.state, queued, fake.now, true);
     assert(!stillPending.trigger && stillPending.verifyBy == pending.verifyBy);
@@ -137,12 +186,14 @@ static void TestDelayedDelivery(void) {
     late.at = fake.now;
     uint64_t idleSince = late.at + MW_SECOND;
     fake.now += 3 * MW_SECOND / 2;
+    late.route = MWRouteBuiltIn;
     pending = MWAutoObserve(&fake.state, late, fake.now, late.at >= idleSince);
     assert(!pending.trigger && !pending.verifyBy); // Edge predates an explicit stop/pause.
     assert(!Active(&fake).trigger);
 
     assert(!Inactive(&fake).trigger);
     late.at = fake.now;
+    late.route = MWRouteUnclear;
     fake.now += 3 * MW_SECOND / 2;
     pending = MWAutoObserve(&fake.state, late, fake.now, true);
     assert(!pending.trigger && pending.verifyBy);
@@ -151,19 +202,30 @@ static void TestDelayedDelivery(void) {
 
     assert(!Inactive(&fake).trigger);
     late.at = fake.now;
-    late.route = MWRouteUnclear;
     fake.now += MW_ROUTE_WINDOW - MW_SECOND / 100;
     pending = MWAutoObserve(&fake.state, late, fake.now, true);
     assert(!pending.trigger && pending.verifyBy == fake.now + MW_ROUTE_WINDOW);
     fake.now += MW_SECOND / 20;
     assert(Active(&fake).trigger); // A late device list still gets one short confirmation window.
+
+    assert(!Inactive(&fake).trigger);
+    late.at = fake.now;
+    fake.now += 2 * MW_SECOND;
+    assert(MWAutoObserve(&fake.state, late, fake.now, true).verifyBy);
+    queued.route = MWRouteOther;
+    queued.at = late.at + MW_SECOND;
+    MWAutoDecision denied = MWAutoObserve(&fake.state, queued, fake.now, true);
+    assert(!denied.trigger && !denied.verifyBy); // A queued external route already disproved the edge.
+    assert(!Active(&fake).trigger);
 }
 
 int main(void) {
     TestSessions();
     TestBaselines();
     TestQueriesAndRoutes();
-    TestDelayedDelivery();
+    TestDelayedConfirmedShortInput();
+    TestOriginalDeadline();
+    TestDelayedUnresolvedRoute();
     puts("Auto mock tests passed: new edges renew, duplicates do not, cancellation, routes, and original event times.");
     return 0;
 }

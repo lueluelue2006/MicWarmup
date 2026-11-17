@@ -120,12 +120,14 @@ mw_flags=(-std=c11 -O2 -Wall -Wextra -Werror "-mmacosx-version-min=$mw_minimum_m
 mw_monitor=(src/DoubaoMonitor.m src/warmup.c src/hal_probe.c)
 mw_compile() { mw_run /usr/bin/xcrun --sdk macosx clang "${mw_flags[@]}" "$@"; }
 
-mw_log "Running five mock test suites on $mw_host_arch."
+mw_log "Running six mock test suites on $mw_host_arch."
 mw_compile -arch "$mw_host_arch" tests/test_warmup.c src/warmup.c -o "$mw_test_output/test_warmup"
 mw_run "$mw_test_output/test_warmup"
+mw_compile -arch "$mw_host_arch" tests/test_hal_probe.c src/hal_probe.c src/warmup.c -o "$mw_test_output/test_hal_probe"
+mw_run "$mw_test_output/test_hal_probe"
 mw_compile -arch "$mw_host_arch" tests/test_control.c src/control.c src/warmup.c -o "$mw_test_output/test_control"
 mw_run "$mw_test_output/test_control"
-mw_compile -arch "$mw_host_arch" -Dmain=MWHelperEntry -c src/helper.c -o "$mw_test_output/helper_entry.o"
+mw_compile -arch "$mw_host_arch" -Dmain=MWHelperEntry -DMWNow=MWTestNow -c src/helper.c -o "$mw_test_output/helper_entry.o"
 mw_compile -arch "$mw_host_arch" tests/test_helper.c src/control.c src/warmup.c \
     "$mw_test_output/helper_entry.o" -o "$mw_test_output/test_helper"
 mw_run "$mw_test_output/test_helper"

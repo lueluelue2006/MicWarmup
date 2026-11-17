@@ -20,6 +20,7 @@ typedef struct {
     int32_t pid;
     uint32_t object;
     MWInputActivity last;
+    uint64_t lastReadingAt;
     uint64_t verifyFrom;
     uint64_t verifyBy;
     uint64_t edgeAt;
@@ -30,6 +31,8 @@ typedef struct { bool trigger; uint64_t verifyBy; uint64_t triggerAt; } MWAutoDe
 // Allow triggers while enabled and awake, including starting/active warmup.
 // A trigger starts an idle session or renews the current one; stopping excludes it.
 // Reset the state when pausing, resuming or waking, not when a session ends.
+// Deliver current-epoch, current-binding observations after route/cancellation vetoes.
+// triggerAt is the original edge time. MW_ROUTE_WINDOW bounds verification of an unknown route.
 MWAutoDecision MWAutoObserve(MWAutoState *state, MWAutoReading reading, uint64_t now, bool mayStart);
 
 #endif

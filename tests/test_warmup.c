@@ -7,7 +7,11 @@ typedef struct {
     MWInput input;
     uint64_t now, cancelAt, disconnectAt;
     MWInterrupt requested;
-    int startStatus, stopStatus, starts, stops, reports;
+    const MWDeviceState *readings;
+    size_t readingCount, checks;
+    uint64_t checkedAt[5], reportedAt;
+    MWInterrupt interruptOnLastRead, interruptDuringReport;
+    int startStatus, stopStatus, starts, stops, reports, probes;
     bool stopDuringProbe, stopDuringStart;
 } Mock;
 
@@ -18,6 +22,7 @@ static Mock NewMock(void) {
 
 static MWInput Probe(void *ctx) {
     Mock *mock = ctx;
+    mock->probes++;
     if (mock->stopDuringProbe) mock->requested = MWCancel;
     return mock->input;
 }
@@ -34,16 +39,25 @@ static int32_t Stop(void *ctx, MWDeviceID id) {
     mock->stops++;
     return mock->stopStatus;
 }
-static bool StillAvailable(void *ctx, MWDeviceID id) {
+static MWDeviceState DeviceState(void *ctx, MWDeviceID id) {
     Mock *mock = ctx;
-    return id == mock->input.id && mock->now < mock->disconnectAt;
+    assert(id == mock->input.id);
+    size_t index = mock->checks++;
+    if (index < sizeof(mock->checkedAt) / sizeof(mock->checkedAt[0])) mock->checkedAt[index] = mock->now;
+    if (index < mock->readingCount) {
+        if (index + 1 == mock->readingCount) mock->requested = mock->interruptOnLastRead;
+        return mock->readings[index];
+    }
+    return mock->now < mock->disconnectAt ? MWDeviceAvailable : MWDeviceUnavailable;
 }
 static bool Report(void *ctx, MWBefore before) {
     Mock *mock = ctx;
     assert(mock->starts == 1 && mock->startStatus == 0 && mock->stops == 0);
     assert(mock->reports == 0 && before == mock->input.before);
     mock->reports++;
-    return true;
+    mock->reportedAt = mock->now;
+    mock->requested = mock->interruptDuringReport;
+    return mock->requested == MWContinue;
 }
 static MWInterrupt Interrupt(void *ctx) {
     Mock *mock = ctx;
@@ -53,7 +67,7 @@ static uint64_t Now(void *ctx) { return ((Mock *)ctx)->now; }
 static void Pause(void *ctx, uint64_t duration) { ((Mock *)ctx)->now += duration; }
 
 static MWOutcome Run(Mock *mock, uint64_t duration) {
-    MWOps ops = { mock, Probe, Start, Stop, StillAvailable, Report, Interrupt, Now, Pause };
+    MWOps ops = { mock, Probe, Start, Stop, DeviceState, Report, Interrupt, Now, Pause };
     return MWRun(&ops, mock->now + duration);
 }
 
@@ -73,8 +87,10 @@ static void TestSelection(void) {
     assert(Run(&mock, MW_SECOND) == MWNoDevice && !mock.starts);
     mock.input = ambiguous;
     assert(Run(&mock, MW_SECOND) == MWMultipleDevices && !mock.starts);
-    mock.input.selection = MWInputQueryFailed;
-    assert(Run(&mock, MW_SECOND) == MWQueryFailed && !mock.starts);
+    Mock unknown = NewMock();
+    unknown.input.selection = MWInputQueryFailed;
+    assert(Run(&unknown, MW_SECOND) == MWQueryFailed);
+    assert(unknown.probes == 1 && !unknown.starts && !unknown.stops && !unknown.checks);
 }
 
 static void TestRepeatedStart(void) {
@@ -101,6 +117,7 @@ static void TestPairedStop(void) {
     Mock unplug = NewMock();
     unplug.disconnectAt = unplug.now + MW_SECOND / 2;
     assert(Run(&unplug, 2 * MW_SECOND) == MWDeviceChanged);
+    assert(unplug.now == unplug.disconnectAt && unplug.checks == 2);
     assert(unplug.starts == 1 && unplug.stops == 1 && unplug.reports == 1);
 
     Mock cancelWhileStarting = NewMock();
@@ -126,11 +143,90 @@ static void TestErrors(void) {
     assert(stop.starts == 1 && stop.stops == 1 && stop.reports == 1);
 }
 
+static Mock WithReadings(const MWDeviceState *readings, size_t count) {
+    Mock mock = NewMock();
+    mock.readings = readings;
+    mock.readingCount = count;
+    return mock;
+}
+
+static void TestRecoverableReads(void) {
+    const uint64_t retry = MW_SECOND / 20, interval = MW_SECOND / 2;
+    const MWDeviceState firstRead[] = { MWDeviceUnknown, MWDeviceAvailable };
+    Mock startup = WithReadings(firstRead, 2);
+    startup.cancelAt = startup.now + interval;
+    assert(Run(&startup, MW_SECOND) == MWStopped);
+    assert(startup.checks == 2 && startup.checkedAt[1] - startup.checkedAt[0] == retry);
+    assert(startup.reportedAt == startup.checkedAt[1]);
+    assert(startup.starts == 1 && startup.stops == 1 && startup.reports == 1);
+
+    const MWDeviceState intermittent[] = { MWDeviceAvailable, MWDeviceUnknown, MWDeviceAvailable,
+                                           MWDeviceUnknown, MWDeviceAvailable };
+    Mock active = WithReadings(intermittent, 5);
+    active.cancelAt = active.now + 3 * interval;
+    assert(Run(&active, 2 * MW_SECOND) == MWStopped);
+    assert(active.checks == 5 && active.starts == 1 && active.stops == 1 && active.reports == 1);
+    assert(active.checkedAt[1] - active.checkedAt[0] == interval);
+    assert(active.checkedAt[2] - active.checkedAt[1] == retry);
+    assert(active.checkedAt[3] - active.checkedAt[2] == interval);
+    assert(active.checkedAt[4] - active.checkedAt[3] == retry);
+}
+
+static void TestUnconfirmedOrChanged(void) {
+    const MWDeviceState unknown[] = { MWDeviceAvailable, MWDeviceUnknown, MWDeviceUnknown };
+    Mock active = WithReadings(unknown, 3);
+    assert(Run(&active, 2 * MW_SECOND) == MWSessionQueryFailed);
+    assert(active.checks == 3 && active.reports == 1 && active.starts == 1 && active.stops == 1);
+    assert(active.now == active.checkedAt[2] && active.checkedAt[2] - active.checkedAt[1] == MW_SECOND / 20);
+
+    Mock startup = WithReadings(unknown + 1, 2);
+    assert(Run(&startup, MW_SECOND) == MWSessionQueryFailed);
+    assert(startup.checks == 2 && !startup.reports && startup.starts == 1 && startup.stops == 1);
+
+    Mock failedStop = WithReadings(unknown, 3);
+    failedStop.stopStatus = -1;
+    assert(Run(&failedStop, MW_SECOND) == MWStopFailed && failedStop.stops == 1);
+
+    const MWDeviceState changed[] = { MWDeviceUnknown, MWDeviceUnavailable };
+    Mock replaced = WithReadings(changed, 2);
+    assert(Run(&replaced, MW_SECOND) == MWDeviceChanged);
+    assert(replaced.checks == 2 && !replaced.reports && replaced.stops == 1);
+
+    Mock unavailable = WithReadings(changed + 1, 1);
+    assert(Run(&unavailable, MW_SECOND) == MWDeviceChanged);
+    assert(unavailable.now == unavailable.checkedAt[0] && unavailable.checks == 1);
+    assert(!unavailable.reports && unavailable.stops == 1);
+}
+
+static void TestInterruptionDuringRecheck(void) {
+    const MWDeviceState unreadable[] = { MWDeviceUnknown, MWDeviceUnknown };
+    Mock cancelled = WithReadings(unreadable, 2);
+    cancelled.cancelAt = cancelled.now + MW_SECOND / 20;
+    assert(Run(&cancelled, MW_SECOND) == MWStopped);
+    assert(cancelled.checks == 1 && cancelled.stops == 1 && !cancelled.reports);
+
+    Mock deadline = WithReadings(unreadable, 2);
+    assert(Run(&deadline, MW_SECOND / 20) == MWExpired);
+    assert(deadline.checks == 1 && deadline.stops == 1 && !deadline.reports);
+
+    Mock duringRead = WithReadings(unreadable, 2);
+    duringRead.interruptOnLastRead = MWTimeUp;
+    assert(Run(&duringRead, MW_SECOND) == MWExpired);
+    assert(duringRead.checks == 2 && duringRead.stops == 1 && !duringRead.reports);
+
+    Mock duringReport = NewMock();
+    duringReport.interruptDuringReport = MWControlError;
+    assert(Run(&duringReport, MW_SECOND) == MWControlFailed && duringReport.stops == 1);
+}
+
 int main(void) {
     TestSelection();
     TestRepeatedStart();
     TestPairedStop();
     TestErrors();
-    puts("Mock tests passed: device eligibility, duplicate starts, balanced stops, and failures.");
+    TestRecoverableReads();
+    TestUnconfirmedOrChanged();
+    TestInterruptionDuringRecheck();
+    puts("Mock tests passed: device eligibility, balanced stops, and bounded session rechecks.");
     return 0;
 }

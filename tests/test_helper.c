@@ -9,6 +9,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -16,13 +17,52 @@
 // Link the production helper entry point and control pipe code against a fake HAL.
 int MWHelperEntry(int argc, char **argv);
 
-typedef enum { Healthy, HangStart, HangStop } Mode;
+typedef enum { Healthy, HangProbe, HangStart, HangFirstCheck, HangStop,
+               LateReady, LateReadyStopError, LateReadyHangStop } Mode;
 static Mode mode;
 static int halEvents;
+static _Atomic(uint64_t) *testClock;
+enum { PollNormally, HoldNextPoll, PollHeld };
+static atomic_int pollGate;
+static _Thread_local bool audioWorker;
+
+static void WaitWhile(int gate) {
+    const struct timespec shortWait = { .tv_nsec = 1000000 };
+    while (atomic_load(&pollGate) == gate) nanosleep(&shortWait, NULL);
+}
+
+// Only the test build of helper.c uses this clock. Parent-side timeouts stay real.
+uint64_t MWTestNow(void) {
+    int expected = HoldNextPoll;
+    if (!audioWorker && atomic_compare_exchange_strong(&pollGate, &expected, PollHeld)) {
+        WaitWhile(PollHeld);
+    }
+    return testClock ? atomic_load(testClock) : MWNow();
+}
 
 MWInput MWProbeBuiltInInput(bool includeRunningStatus) {
     (void)includeRunningStatus;
+    audioWorker = true;
+    if (mode == HangProbe) {
+        assert(write(halEvents, "?", 1) == 1);
+        for (;;) pause();
+    }
     return (MWInput){ MWInputOK, 17, MWBeforeStopped };
+}
+
+MWDeviceState MWCheckBuiltInInput(MWDeviceID device) {
+    if (mode == HangFirstCheck) {
+        assert(write(halEvents, "?", 1) == 1);
+        for (;;) pause();
+    }
+    if (mode == LateReady || mode == LateReadyStopError || mode == LateReadyHangStop) {
+        // Let a successful hardware result reach the worker exactly at the cutoff,
+        // with the supervisor descheduled until the worker actually requests stop.
+        atomic_store(&pollGate, HoldNextPoll);
+        WaitWhile(HoldNextPoll);
+        atomic_fetch_add(testClock, MW_START_LIMIT);
+    }
+    return device == 17 ? MWDeviceAvailable : MWDeviceUnavailable;
 }
 
 OSStatus AudioDeviceStart(AudioDeviceID device, AudioDeviceIOProcID proc) {
@@ -33,8 +73,10 @@ OSStatus AudioDeviceStart(AudioDeviceID device, AudioDeviceIOProcID proc) {
 
 OSStatus AudioDeviceStop(AudioDeviceID device, AudioDeviceIOProcID proc) {
     assert(device == 17 && !proc && write(halEvents, "-", 1) == 1);
-    while (mode == HangStop) pause();
-    return 0;
+    if (mode == LateReadyHangStop) atomic_fetch_add(testClock, MW_STOP_GRACE);
+    atomic_store(&pollGate, PollNormally);
+    while (mode == HangStop || mode == LateReadyHangStop) pause();
+    return mode == LateReadyStopError ? -1 : 0;
 }
 
 typedef struct {
@@ -43,15 +85,14 @@ typedef struct {
 } Process;
 
 static Process NewProcess(uint64_t duration) {
-    Process p = { .deadline = MWNow() + duration };
+    Process p = { .deadline = MWTestNow() + duration };
     assert(pipe(p.command) == 0 && pipe(p.output) == 0 && pipe(p.audio) == 0);
     return p;
 }
 
 static void Close(int fd) { assert(close(fd) == 0); }
 
-static pid_t Launch(Process p, Mode selected) {
-    pid_t owner = getpid();
+static pid_t LaunchForOwner(Process p, Mode selected, pid_t owner) {
     pid_t child = fork();
     assert(child >= 0);
     if (child) return child;
@@ -68,6 +109,10 @@ static pid_t Launch(Process p, Mode selected) {
     snprintf(expiryText, sizeof(expiryText), "%" PRIu64, p.deadline);
     char *constArgs[] = { "test-helper", "--ui-session", ownerText, expiryText, NULL };
     _exit(MWHelperEntry(4, constArgs));
+}
+
+static pid_t Launch(Process p, Mode selected) {
+    return LaunchForOwner(p, selected, getpid());
 }
 
 static void CloseChildEnds(Process p) {
@@ -203,7 +248,7 @@ static void TestFullOutputCannotHang(void) {
     ExpectEOF(p.audio[0]);
 }
 
-static void TestStartupWatchdog(void) {
+static void TestCancelledHungStart(void) {
     Process p = NewProcess(10 * MW_SECOND);
     pid_t child = Launch(p, HangStart);
     CloseChildEnds(p);
@@ -219,6 +264,94 @@ static void TestStartupWatchdog(void) {
     Close(p.command[1]);
     ExpectEOF(p.audio[0]);
     ExpectEOF(p.output[0]);
+}
+
+static void TestUnrenewableStartup(Mode stalled) {
+    uint64_t began = MWTestNow();
+    Process p = NewProcess(MW_LIMIT);
+    pid_t child = Launch(p, stalled);
+    CloseChildEnds(p);
+    Write(p.command[1], "S", 1);
+    if (stalled != HangProbe) ExpectByte(p.audio[0], '+');
+    if (stalled != HangStart) ExpectByte(p.audio[0], '?');
+
+    const uint64_t elapsed[] = { MW_SECOND, MW_START_LIMIT / 2, MW_START_LIMIT - 1 };
+    for (size_t i = 0; i < sizeof(elapsed) / sizeof(*elapsed); i++) {
+        uint64_t now = began + elapsed[i];
+        atomic_store(testClock, now);
+        WriteRenew(p, now + MW_LIMIT);
+        ExpectAck(p, now + MW_LIMIT);
+    }
+    atomic_store(testClock, began + MW_START_LIMIT);
+    ExpectExit(child, MWStartTimedOut);
+    Close(p.command[1]);
+    ExpectEOF(p.audio[0]);
+    ExpectEOF(p.output[0]); // No false active status or further acknowledgment.
+}
+
+static void TestActiveOutlivesStartupLimit(void) {
+    uint64_t began = MWTestNow();
+    Process p = NewProcess(MW_LIMIT);
+    pid_t child = Launch(p, Healthy);
+    CloseChildEnds(p);
+    Write(p.command[1], "S", 1);
+    ExpectActive(p);
+
+    const uint64_t edges[] = { began + MW_START_LIMIT, p.deadline + MW_SECOND };
+    for (size_t i = 0; i < sizeof(edges) / sizeof(*edges); i++) {
+        atomic_store(testClock, edges[i]);
+        WriteRenew(p, edges[i] + MW_LIMIT);
+        ExpectAck(p, edges[i] + MW_LIMIT);
+    }
+    atomic_store(testClock, edges[1] + MW_LIMIT);
+    ExpectExit(child, MWExpired);
+    Close(p.command[1]);
+    ExpectByte(p.audio[0], '-');
+    ExpectEOF(p.audio[0]); // Exactly one start and one stop across both renewals.
+    ExpectEOF(p.output[0]);
+}
+
+static void TestLateReady(Mode selected, uint64_t lease, int code) {
+    Process p = NewProcess(lease);
+    pid_t child = Launch(p, selected);
+    CloseChildEnds(p);
+    Write(p.command[1], "S", 1);
+    ExpectExit(child, code);
+    Close(p.command[1]);
+    ExpectByte(p.audio[0], '+');
+    ExpectByte(p.audio[0], '-');
+    ExpectEOF(p.audio[0]);
+    ExpectEOF(p.output[0]);
+}
+
+static void ExpectExitBeforeStart(Process p, pid_t owner, int outcome) {
+    pid_t child = LaunchForOwner(p, HangProbe, owner);
+    CloseChildEnds(p);
+    ExpectExit(child, outcome);
+    Close(p.command[1]);
+    ExpectEOF(p.audio[0]);
+    ExpectEOF(p.output[0]);
+}
+
+static void TestExpiryAtLaunch(void) {
+    Process exact = NewProcess(MW_SECOND);
+    atomic_store(testClock, exact.deadline);
+    ExpectExitBeforeStart(exact, getpid(), MWExpired);
+
+    Process late = NewProcess(MW_SECOND);
+    atomic_store(testClock, late.deadline + 1);
+    ExpectExitBeforeStart(late, getpid(), MWExpired);
+
+    ExpectExitBeforeStart(NewProcess(0), getppid(), MWControlFailed);
+    Process wrongPipe = NewProcess(0);
+    Close(wrongPipe.command[0]);
+    wrongPipe.command[0] = open("/dev/null", O_RDONLY);
+    assert(wrongPipe.command[0] >= 0);
+    ExpectExitBeforeStart(wrongPipe, getpid(), MWControlFailed);
+    Process invalid = NewProcess(0);
+    invalid.deadline = 0;
+    ExpectExitBeforeStart(invalid, getpid(), MWControlFailed);
+    ExpectExitBeforeStart(NewProcess(MW_LIMIT + 1), getpid(), MWControlFailed);
 }
 
 static void TestStopWatchdog(void) {
@@ -266,9 +399,23 @@ int main(void) {
     TestSplitAndPackedFrames();
     TestEOFBeatsQueuedRenewal();
     TestFullOutputCannotHang();
-    TestStartupWatchdog();
+    TestCancelledHungStart();
     TestStopWatchdog();
     TestOwnerExit();
-    puts("Fake HAL helper tests passed: framing, EOF, backpressure, owner loss, and both watchdog paths.");
+    testClock = mmap(NULL, sizeof(*testClock), PROT_READ | PROT_WRITE,
+                     MAP_ANON | MAP_SHARED, -1, 0);
+    assert(testClock != MAP_FAILED);
+    atomic_init(testClock, MW_SECOND);
+    TestExpiryAtLaunch();
+    TestUnrenewableStartup(HangProbe);
+    TestUnrenewableStartup(HangStart);
+    TestUnrenewableStartup(HangFirstCheck);
+    TestActiveOutlivesStartupLimit();
+    TestLateReady(LateReady, MW_LIMIT, MWStartTimedOutStopped);
+    TestLateReady(LateReady, MW_START_LIMIT - 1, MWExpired);
+    TestLateReady(LateReadyStopError, MW_LIMIT, MWStopFailed);
+    TestLateReady(LateReadyHangStop, MW_LIMIT, MWWatchdog);
+    assert(munmap(testClock, sizeof(*testClock)) == 0);
+    puts("Fake HAL helper tests passed, including stalled startup and active lease renewal.");
     return 0;
 }
