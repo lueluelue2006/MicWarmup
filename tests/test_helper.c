@@ -340,6 +340,8 @@ static void TestExpiryAtLaunch(void) {
 
     Process late = NewProcess(MW_SECOND);
     atomic_store(testClock, late.deadline + 1);
+    Write(late.command[1], "S", 1);
+    WriteRenew(late, MWTestNow() + MW_LIMIT);
     ExpectExitBeforeStart(late, getpid(), MWExpired);
 
     ExpectExitBeforeStart(NewProcess(0), getppid(), MWControlFailed);
